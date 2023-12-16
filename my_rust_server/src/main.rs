@@ -1,136 +1,190 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
-  extract::{Path, Query, State},
-  http::{self, Response, StatusCode},
-  response::{Html, IntoResponse, Redirect},
-  routing::get,
+  extract::{Path, State},
+  http::StatusCode,
+  response::{Html, IntoResponse, Response},
+  routing::{delete, get},
   Extension, Form, Router,
 };
-use contact::{Contact, Contacts, DatabaseConnection};
-use http::header::SET_COOKIE;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use tera::Tera;
-use tokio::sync::Mutex;
+use tokio::sync::broadcast::{channel, Sender};
+use tower::ServiceBuilder;
 
-mod contact;
+pub type TodosStream = Sender<TodoUpdate>;
 
-type ContactsState = State<Arc<Mutex<Contacts>>>;
+// src/main.rs
+#[derive(Clone, Serialize, Debug)]
+enum MutationKind {
+  Create,
+  Delete,
+}
 
-#[tokio::main]
-async fn main() {
-  // Define the application routes
+#[derive(Clone, Serialize, Debug)]
+pub struct TodoUpdate {
+  mutation_kind: MutationKind,
+  id:            i32,
+}
+
+#[derive(sqlx::FromRow, Serialize, Deserialize)]
+struct Todo {
+  id:          i32,
+  description: String,
+}
+
+#[derive(sqlx::FromRow, Serialize, Deserialize)]
+struct TodoNew {
+  description: String,
+}
+
+#[derive(Clone)]
+struct AppState {
+  db: PgPool,
+}
+
+#[shuttle_runtime::main]
+async fn main(#[shuttle_shared_db::Postgres] db: PgPool) -> shuttle_axum::ShuttleAxum {
+  sqlx::migrate!().run(&db).await.expect("Looks like something went wrong with migrations :(");
+
+  let (tx, _rx) = channel::<TodoUpdate>(10);
+  let state = AppState { db };
   let tera = Arc::new(tera::Tera::new("templates/**/*").expect("failure parsing templates"));
-  let db = Arc::new(Mutex::new(Contacts::load_db()));
+  let router = init_router(state, tx, tera).expect("Failed to init router");
 
-  let app = Router::new()
-    .route("/", get(get_index))
-    .route("/world", get(|| async { Redirect::permanent("/hello") }))
-    .route("/hello", get(get_hello))
-    .route("/contacts", get(get_contacts))
-    // .route("/contacts/new", get(get_new_contact).post(post_new_contact))
-    .route("/contacts/:contact_id", get(get_contacts_view))
-    .layer(Extension(tera))
-    // .layer(Extension(contacts));
-    .with_state(db);
-
-  // Run the server
-  let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await.unwrap();
-  axum::serve(listener, app).await.unwrap();
+  Ok(router.into())
 }
 
-async fn get_hello() -> &'static str { "Hello World!" }
+fn init_router(
+  state: AppState,
+  tx: TodosStream,
+  tera: Arc<tera::Tera>,
+) -> Result<Router<()>, axum::Error> {
+  let router = Router::new()
+    .route("/", get(home))
+    .route("/stream", get(stream))
+    .route("/styles.css", get(styles))
+    .route("/todos", get(fetch_todos).post(create_todo))
+    .route("/todos/:id", delete(delete_todo))
+    .route("/todos/stream", get(stream::handle_stream))
+    .with_state(state)
+    .layer(
+      ServiceBuilder::new()
+                .layer(tower_http::trace::TraceLayer::new_for_http())
+                .layer(tower_http::compression::CompressionLayer::new())
+                // .layer(tower_http::add_extension::AddExtensionLayer::new(tera))
+                .layer(Extension(tera))
+                .layer(Extension(tx))
+                .into_inner(),
+    );
 
-async fn get_index(tera: Extension<Arc<Tera>>) -> Html<String> {
+  Ok(router)
+}
+
+type TeraExt = Extension<Arc<Tera>>;
+
+async fn home(tera: TeraExt) -> Html<String> {
   let context = tera::Context::new();
-  let rendered = tera.render("index.html", &context).expect("Failed to render template");
+  let rendered = tera.render("base.html", &context).expect("Failed to render template");
   Html(rendered)
 }
 
-#[derive(Deserialize)]
-struct SearchQuery {
-  q: Option<String>,
+// check stream?
+async fn stream(tera: TeraExt) -> impl IntoResponse {
+  let context = tera::Context::new();
+  let rendered = tera.render("stream.html", &context).expect("Failed to render template");
+  Html(rendered)
 }
 
-/// Handler for the `/contacts` route.
-/// Allow the user to search for a particular contact.
-async fn get_contacts(
-  Query(query): Query<SearchQuery>,
-  State(contacts): ContactsState,
-  tera: Extension<Arc<Tera>>,
+async fn fetch_todos(State(state): State<AppState>, Extension(tera): TeraExt) -> Html<String> {
+  let mut context = tera::Context::new();
+  let todos = sqlx::query_as::<_, Todo>("SELECT * FROM TODOS").fetch_all(&state.db).await.unwrap();
+
+  context.insert("todos", &todos);
+  let rendered = tera.render("todos.html", &context).expect("Failed to render template");
+  Html(rendered)
+}
+
+pub async fn styles() -> impl IntoResponse {
+  Response::builder()
+    .status(StatusCode::OK)
+    .header("Content-Type", "text/css")
+    .body(include_str!("../static/styles.css").to_owned())
+    .unwrap()
+}
+
+async fn create_todo(
+  State(state): State<AppState>,
+  Extension(tx): Extension<TodosStream>,
+  Extension(tera): TeraExt,
+  Form(form): Form<TodoNew>,
 ) -> Html<String> {
   let mut context = tera::Context::new();
-  let contacts = contacts.lock().await;
+  let todo = sqlx::query_as::<_, Todo>(
+    "INSERT INTO TODOS (description) VALUES ($1) RETURNING id, description",
+  )
+  .bind(form.description)
+  .fetch_one(&state.db)
+  .await
+  .unwrap();
 
-  match query.q {
-    Some(ref search) => {
-      let contacts = contacts.search(search);
-      context.insert("q", search);
-      context.insert("contacts", &contacts);
-    },
-    None => context.insert("contacts", &*contacts),
-  };
+  if let Err(e) =
+    tx.send(TodoUpdate { mutation_kind: MutationKind::Create, id: todo.id })
+  {
+    eprintln!(
+      "Tried to send log of record with ID {} created but something went wrong: {e}",
+      todo.id
+    );
+  }
 
-  let rendered = tera.render("contacts.html", &context).expect("Failed to render template");
-
+  context.insert("todo", &todo);
+  let rendered = tera.render("todo.html", &context).expect("Failed to render template");
   Html(rendered)
 }
 
-/// look for a contact with some contact id.
-async fn get_contacts_view(
-  Path(contact_id): Path<usize>,
-  tera: Extension<Arc<Tera>>,
-  State(contacts): ContactsState,
-) -> Html<String> {
-  dbg!(contact_id);
-  let contacts = contacts.lock().await;
-  let mut context = tera::Context::new();
-  let contact = contacts.get(contact_id).unwrap();
-  context.insert("contact", &contact);
+async fn delete_todo(
+  State(state): State<AppState>,
+  Path(id): Path<i32>,
+  Extension(tx): Extension<TodosStream>,
+) -> impl IntoResponse {
+  sqlx::query("DELETE FROM TODOS WHERE ID = $1").bind(id).execute(&state.db).await.unwrap();
 
-  let rendered = tera.render("show.html", &context).expect("Failed to render template");
+  if let Err(e) = tx.send(TodoUpdate { mutation_kind: MutationKind::Delete, id }) {
+    eprintln!("Tried to send log of record with ID {id} created but something went wrong: {e}");
+  }
 
-  Html(rendered)
+  StatusCode::OK
 }
 
-async fn get_new_contact(Extension(tera): Extension<Arc<Tera>>) -> Html<String> {
-  // seems dumb to call this "errors"
-  let _cookies = http::header::HeaderValue::from_static("flash=; Path=/; HttpOnly");
-  let mut errors = HashMap::new();
+mod stream {
+  use std::{convert::Infallible, time::Duration};
 
-  errors.insert("phone", "Phone number is required.");
-  errors.insert("last", "Phone number is required.");
-  errors.insert("first", "Phone number is required.");
-  errors.insert("id", "Phone number is required.");
-  errors.insert("email", "Phone number is required.");
+  use axum::response::{sse::Event, Sse};
+  use serde_json::json;
+  use tokio_stream::{wrappers::BroadcastStream, Stream, StreamExt as _};
 
-  let mut context = tera::Context::new();
-  context.insert("errors", &errors);
+  use super::*;
+  pub async fn handle_stream(
+    Extension(tx): Extension<TodosStream>,
+  ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let rx = tx.subscribe();
 
-  let rendered = tera.render("new.html", &context).expect("Failed to render template");
-  Html(rendered)
-}
+    let stream = BroadcastStream::new(rx);
 
-async fn post_new_contact(
-  Form(contact): Form<Contact>,
-  DatabaseConnection(contacts): DatabaseConnection,
-) -> Result<impl IntoResponse, Html<String>> {
-  dbg!(&contact);
-  let mut contacts = contacts.lock().await;
-
-  contacts.insert(contact);
-  contacts.save_db();
-
-  // create a cookie and redirect to contacts
-  let response = Response::builder()
-        .status(StatusCode::SEE_OTHER)
-        .header(
-            SET_COOKIE,
-            format!("flash=Created New Contact!; Path=/; HttpOnly"),
-        )
-        .header(http::header::LOCATION, "/contacts") // will redirect back to contacts
-        .body(axum::body::Body::from("Redirecting..."))
-        .unwrap();
-
-  Ok(response)
+    Sse::new(
+      stream
+        .map(|msg| {
+          let msg = msg.unwrap();
+          let json = format!("<div>{}</div>", json!(msg));
+          Event::default().data(json)
+        })
+        .map(Ok),
+    )
+    .keep_alive(
+      axum::response::sse::KeepAlive::new()
+        .interval(Duration::from_secs(600))
+        .text("keep-alive-text"),
+    )
+  }
 }
