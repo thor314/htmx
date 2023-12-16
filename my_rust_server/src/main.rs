@@ -71,7 +71,7 @@ fn init_router(
     .with_state(state)
     .layer(
       ServiceBuilder::new()
-                .layer(tower_http::trace::TraceLayer::new_for_http())
+                // .layer(tower_http::trace::TraceLayer::new_for_http())
                 .layer(tower_http::compression::CompressionLayer::new())
                 // .layer(tower_http::add_extension::AddExtensionLayer::new(tera))
                 .layer(Extension(tera))
