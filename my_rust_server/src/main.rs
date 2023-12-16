@@ -28,7 +28,7 @@ pub struct TodoUpdate {
   id:            i32,
 }
 
-#[derive(sqlx::FromRow, Serialize, Deserialize)]
+#[derive(sqlx::FromRow, Serialize, Deserialize, Debug)]
 struct Todo {
   id:          i32,
   description: String,
@@ -69,15 +69,11 @@ fn init_router(
     .route("/todos/:id", delete(delete_todo))
     .route("/todos/stream", get(stream::handle_stream))
     .with_state(state)
-    .layer(
-      ServiceBuilder::new()
-                // .layer(tower_http::trace::TraceLayer::new_for_http())
-                .layer(tower_http::compression::CompressionLayer::new())
-                // .layer(tower_http::add_extension::AddExtensionLayer::new(tera))
+    .layer(ServiceBuilder::new()
+                // .layer(tower_http::trace::TraceLayer::new_for_http()) // shuttle inserts its own trace layer
+                // .layer(tower_http::compression::CompressionLayer::new())
                 .layer(Extension(tera))
-                .layer(Extension(tx))
-                .into_inner(),
-    );
+                .layer(Extension(tx)));
 
   Ok(router)
 }
@@ -86,11 +82,10 @@ type TeraExt = Extension<Arc<Tera>>;
 
 async fn home(tera: TeraExt) -> Html<String> {
   let context = tera::Context::new();
-  let rendered = tera.render("base.html", &context).expect("Failed to render template");
+  let rendered = tera.render("index.html", &context).expect("Failed to render template");
   Html(rendered)
 }
 
-// check stream?
 async fn stream(tera: TeraExt) -> impl IntoResponse {
   let context = tera::Context::new();
   let rendered = tera.render("stream.html", &context).expect("Failed to render template");
@@ -98,10 +93,13 @@ async fn stream(tera: TeraExt) -> impl IntoResponse {
 }
 
 async fn fetch_todos(State(state): State<AppState>, Extension(tera): TeraExt) -> Html<String> {
-  let mut context = tera::Context::new();
   let todos = sqlx::query_as::<_, Todo>("SELECT * FROM TODOS").fetch_all(&state.db).await.unwrap();
+  // dbg!(&todos);
 
+  let mut context = tera::Context::new();
   context.insert("todos", &todos);
+  // let v: Vec<Todo> = vec![];
+  // context.insert("todos", &v);
   let rendered = tera.render("todos.html", &context).expect("Failed to render template");
   Html(rendered)
 }
